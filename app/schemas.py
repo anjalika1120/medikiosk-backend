@@ -6,7 +6,6 @@ class RegisterRequest(BaseModel):
     password: str
 
     @field_validator("username")
-    @classmethod
     def validate_username(cls, v: str) -> str:
         v = v.strip()
         if len(v) < 3:
@@ -14,7 +13,6 @@ class RegisterRequest(BaseModel):
         return v
 
     @field_validator("password")
-    @classmethod
     def validate_password(cls, v: str) -> str:
         if len(v) < 6:
             raise ValueError("Password must be at least 6 characters.")
