@@ -170,12 +170,11 @@ async def process_text_intake(
 # ==========================================
 # 4. Document / Image (OCR) Upload Endpoint
 # ==========================================
-
 @router.post("/documents")
 async def process_document_intake(
-    user_id: int = Form(..., description="ID of the registered patient"),
-    target_language: str = Form("English", description="Target language for output"),
-    files: List[UploadFile] = File(..., description="Upload prescription images (PNG, JPG) or medical PDFs"),
+    user_id: int = Form(...),
+    target_language: str = Form("English"),
+    file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
     user = db.query(DBUser).filter(DBUser.id == user_id).first()
@@ -185,38 +184,28 @@ async def process_document_intake(
             detail=f"User with ID {user_id} does not exist."
         )
 
-    if not files:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No files were uploaded."
-        )
-
+    file_bytes = await file.read()
+    content_type = file.content_type or ""
     extracted_text_chunks = []
     image_parts = []
-    file_names = []
 
-    for file in files:
-        file_names.append(file.filename)
-        content_type = file.content_type or ""
-        file_bytes = await file.read()
+    # Handle PDF
+    if content_type == "application/pdf" or file.filename.lower().endswith(".pdf"):
+        try:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            pdf_text = "\n".join([page.extract_text() or "" for page in reader.pages])
+            extracted_text_chunks.append(f"[Document: {file.filename}]\n{pdf_text}")
+        except Exception as e:
+            extracted_text_chunks.append(f"[Error reading PDF: {str(e)}]")
 
-        # Handle PDF documents
-        if content_type == "application/pdf" or file.filename.lower().endswith(".pdf"):
-            try:
-                reader = PdfReader(io.BytesIO(file_bytes))
-                pdf_text = "\n".join([page.extract_text() or "" for page in reader.pages])
-                extracted_text_chunks.append(f"[Document: {file.filename}]\n{pdf_text}")
-            except Exception as e:
-                extracted_text_chunks.append(f"[Error reading PDF {file.filename}: {str(e)}]")
-
-        # Handle Image uploads (Prescriptions, Scans)
-        elif content_type.startswith("image/") or file.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
-            image_parts.append({
-                "mime_type": content_type if content_type.startswith("image/") else "image/jpeg",
-                "data": file_bytes
-            })
-        else:
-            extracted_text_chunks.append(f"[Unsupported file type: {file.filename}]")
+    # Handle Image
+    elif content_type.startswith("image/") or file.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+        image_parts.append({
+            "mime_type": content_type if content_type.startswith("image/") else "image/jpeg",
+            "data": file_bytes
+        })
+    else:
+        extracted_text_chunks.append(f"[Unsupported file type: {file.filename}]")
 
     combined_text = "\n\n".join(extracted_text_chunks)
     history_context = get_patient_history_context(db, user_id)
@@ -237,7 +226,7 @@ async def process_document_intake(
         user_id=user_id,
         source_type="document_scan",
         target_language=target_language,
-        raw_input=f"Uploaded Files: {', '.join(file_names)}\n{combined_text}".strip(),
+        raw_input=f"Uploaded File: {file.filename}\n{combined_text}".strip(),
         chief_complaint=primary_complaint,
         extracted_data_json=json.dumps(gemini_result),
         concise_doctor_summary=summary,
@@ -253,6 +242,7 @@ async def process_document_intake(
         gemini_data=gemini_result,
         target_language=target_language
     )
+
 
 
 # ==========================================
