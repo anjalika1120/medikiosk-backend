@@ -1,7 +1,10 @@
+import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DATABASE_URL = "sqlite:///./medikiosk.db"
+# Path points to a permanent local file in your workspace directory
+DB_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "medikiosk.db")
+DATABASE_URL = f"sqlite:///{DB_FILE}"
 
 engine = create_engine(
     DATABASE_URL, 
