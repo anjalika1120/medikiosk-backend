@@ -1,36 +1,20 @@
-import os
 import json
-from fastapi import APIRouter, Depends, HTTPException, Header, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models import DBUser, DBIntakeSession
 
-router = APIRouter(prefix="/api/creator", tags=["Creator / Admin (Protected)"])
-
-# Set your creator secret here or in Render environment variables
-CREATOR_SECRET = os.getenv("CREATOR_ADMIN_SECRET", "admin_medikiosk_secret_2026")
-
-
-def verify_admin(x_admin_secret: str = Header(..., description="Creator Admin Authorization Key")):
-    if x_admin_secret != CREATOR_SECRET:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied: Invalid Creator Admin Secret"
-        )
-    return True
+router = APIRouter(prefix="/api/creator", tags=["Creator / Admin"])
 
 
 # ==========================================
-# 1st GET: All patients data & high-level summary
+# 1. GET: All Patients & High-Level Summary
 # ==========================================
 @router.get("/all-patients")
-def get_all_patients_summary(
-    db: Session = Depends(get_db),
-    authorized: bool = Depends(verify_admin)
-):
+def get_all_patients_summary(db: Session = Depends(get_db)):
     """
-    Creator only: Fetches all registered patients with their session count,
+    Fetches all registered patients with their session count,
     latest chief complaints, and historical summaries.
     """
     users = db.query(DBUser).order_by(DBUser.id.asc()).all()
@@ -58,24 +42,19 @@ def get_all_patients_summary(
         })
 
     return {
-        "system_status": "authorized",
         "total_patients": len(users),
         "patients": dossiers
     }
 
 
 # ==========================================
-# 2nd GET: Complete data and summary for a specific patient via user_id
+# 2. GET: Single Patient Full History & Summary
 # ==========================================
 @router.get("/patient/{user_id}")
-def get_patient_complete_data(
-    user_id: int,
-    db: Session = Depends(get_db),
-    authorized: bool = Depends(verify_admin)
-):
+def get_patient_complete_data(user_id: int, db: Session = Depends(get_db)):
     """
-    Creator only: Inspects all historical intake records, full JSON schema outputs,
-    doctor summaries, and raw customer inputs for a single user ID.
+    Inspects all historical intake records, full JSON schema outputs,
+    doctor summaries, and raw inputs for a specific user ID.
     """
     user = db.query(DBUser).filter(DBUser.id == user_id).first()
     if not user:
@@ -129,3 +108,51 @@ def get_patient_complete_data(
         "sessions": session_list
     }
 
+
+# ==========================================
+# 3. DELETE: Delete Specific Patient by user_id
+# ==========================================
+@router.delete("/patient/{user_id}")
+def delete_patient_by_id(user_id: int, db: Session = Depends(get_db)):
+    """
+    Deletes the patient account and all associated intake sessions for that user_id.
+    """
+    user = db.query(DBUser).filter(DBUser.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Patient with ID {user_id} does not exist."
+        )
+
+    deleted_sessions = (
+        db.query(DBIntakeSession)
+        .filter(DBIntakeSession.user_id == user_id)
+        .delete()
+    )
+
+    db.delete(user)
+    db.commit()
+
+    return {
+        "message": f"Patient ID {user_id} ('{user.username}') and all related records deleted.",
+        "deleted_intake_sessions": deleted_sessions
+    }
+
+
+# ==========================================
+# 4. DELETE: Wipe All Patient Records (Reset Database)
+# ==========================================
+@router.delete("/reset-all")
+def reset_all_patients(db: Session = Depends(get_db)):
+    """
+    Clears all intake sessions and users in the database.
+    """
+    sessions_count = db.query(DBIntakeSession).delete()
+    users_count = db.query(DBUser).delete()
+    db.commit()
+
+    return {
+        "message": "All database records have been deleted.",
+        "total_users_deleted": users_count,
+        "total_sessions_deleted": sessions_count
+    }
