@@ -1,21 +1,39 @@
-import json
+    import json
 from typing import List, Optional
+import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from pwdlib import PasswordHash
 
 from app.database import get_db
 from app.models import DBUser, DBIntakeSession
 
 router = APIRouter(prefix="/api/auth", tags=["Authentication & Creator Management"])
 
-# Password hashing configuration using pwdlib
-pwd_context = PasswordHash.recommended()
+# ==========================================
+# 1. Native Bcrypt Utilities
+# ==========================================
+
+def hash_password(password: str) -> str:
+    """Hashes a plaintext password using bcrypt with a salt."""
+    salt = bcrypt.gensalt(rounds=12)
+    hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
+    return hashed.decode("utf-8")
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verifies a plaintext password against the stored bcrypt hash."""
+    try:
+        return bcrypt.checkpw(
+            plain_password.encode("utf-8"),
+            hashed_password.encode("utf-8")
+        )
+    except Exception:
+        return False
 
 
 # ==========================================
-# 1. Pydantic Schemas
+# 2. Pydantic Schemas
 # ==========================================
 
 class UserRegisterRequest(BaseModel):
@@ -29,13 +47,13 @@ class UserLoginRequest(BaseModel):
 
 
 # ==========================================
-# 2. Registration & Login Endpoints
+# 3. Registration & Login Endpoints
 # ==========================================
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 def register_user(req: UserRegisterRequest, db: Session = Depends(get_db)):
     """
-    Registers a new user/patient, hashes password securely via pwdlib,
+    Registers a new user/patient, hashes password with bcrypt,
     and stores account records in SQLite.
     """
     username_clean = req.username.strip()
@@ -45,6 +63,7 @@ def register_user(req: UserRegisterRequest, db: Session = Depends(get_db)):
             detail="Username cannot be empty."
         )
 
+    # Check for existing user
     existing_user = db.query(DBUser).filter(DBUser.username == username_clean).first()
     if existing_user:
         raise HTTPException(
@@ -52,7 +71,7 @@ def register_user(req: UserRegisterRequest, db: Session = Depends(get_db)):
             detail="Username already registered."
         )
 
-    hashed_pw = pwd_context.hash(req.password)
+    hashed_pw = hash_password(req.password)
 
     new_user = DBUser(
         username=username_clean,
@@ -79,7 +98,7 @@ def register_user(req: UserRegisterRequest, db: Session = Depends(get_db)):
 @router.post("/login")
 def login_user(req: UserLoginRequest, db: Session = Depends(get_db)):
     """
-    Authenticates patient/user credentials against stored hashes.
+    Authenticates patient/user credentials against stored bcrypt hashes.
     """
     user = db.query(DBUser).filter(DBUser.username == req.username.strip()).first()
     if not user:
@@ -88,7 +107,7 @@ def login_user(req: UserLoginRequest, db: Session = Depends(get_db)):
             detail="Invalid username or password."
         )
 
-    if not pwd_context.verify(req.password, user.hashed_password):
+    if not verify_password(req.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password."
@@ -102,7 +121,7 @@ def login_user(req: UserLoginRequest, db: Session = Depends(get_db)):
 
 
 # ==========================================
-# 3. Creator / Admin Inspection Endpoints
+# 4. Creator / Admin Inspection Endpoints
 # ==========================================
 
 @router.get("/creator/user/{user_id}")
@@ -216,7 +235,7 @@ def get_all_kiosk_data(db: Session = Depends(get_db)):
 
 
 # ==========================================
-# 4. Creator / Admin Delete & Cleanup Endpoints
+# 5. Creator / Admin Delete & Reset Endpoints
 # ==========================================
 
 @router.delete("/creator/user/{user_id}")
@@ -231,21 +250,19 @@ def delete_user_and_sessions(user_id: int, db: Session = Depends(get_db)):
             detail=f"User with ID {user_id} does not exist."
         )
 
-    # 1. Delete all intake records for this user first
+    # Delete sessions first
     deleted_sessions_count = (
         db.query(DBIntakeSession)
         .filter(DBIntakeSession.user_id == user_id)
         .delete()
     )
 
-    # 2. Delete the user
+    # Delete user and commit
     db.delete(user)
-
-    # 3. Commit the transaction
     db.commit()
 
     return {
-        "message": f"User {user_id} ('{user.username}') and all linked data deleted successfully.",
+        "message": f"User {user_id} ('{user.username}') and all linked records deleted successfully.",
         "deleted_sessions_count": deleted_sessions_count
     }
 
@@ -253,12 +270,10 @@ def delete_user_and_sessions(user_id: int, db: Session = Depends(get_db)):
 @router.delete("/creator/reset-all")
 def reset_all_database_records(db: Session = Depends(get_db)):
     """
-    Caution: Clears all intake sessions and users from the SQLite database.
-    Useful for wiping test data during development.
+    Clears all intake sessions and users from the database.
     """
     sessions_deleted = db.query(DBIntakeSession).delete()
     users_deleted = db.query(DBUser).delete()
-
     db.commit()
 
     return {
