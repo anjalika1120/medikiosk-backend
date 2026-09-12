@@ -1,3 +1,4 @@
+import json
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from app.database import get_db
@@ -5,7 +6,7 @@ from app.models import DBUser, DBIntakeSession
 from app.schemas import RegisterRequest, LoginRequest
 from app.security import hash_password, verify_password
 
-router = APIRouter(prefix="/api/auth", tags=["Authentication & Creator Admin"])
+router = APIRouter(prefix="/api/auth", tags=["Authentication & Creator Management"])
 
 @router.post("/register")
 def register_user(req: RegisterRequest, db: Session = Depends(get_db)):
@@ -39,25 +40,57 @@ def login_user(req: LoginRequest, db: Session = Depends(get_db)):
         "role": user.role
     }
 
-# ==================== CREATOR CONTROLS ====================
+# ==================== CREATOR INSPECTION CONTROLS ====================
 
-@router.get("/users")
-def get_all_users(db: Session = Depends(get_db)):
-    """Creator view: lists every registered user."""
+def parse_extracted_data(raw_json_str: str):
+    """Safely converts stored JSON strings into dictionary format for clean API display."""
+    if not raw_json_str:
+        return None
+    try:
+        return json.loads(raw_json_str)
+    except Exception:
+        return raw_json_str
+
+@router.get("/creator/all-data")
+def get_all_patients_data(db: Session = Depends(get_db)):
+    """Creator view: Fetches all registered users along with all their raw inputs, 
+    scanned files, audio uploads, and complete AI extractions across the entire database."""
     users = db.query(DBUser).order_by(DBUser.created_at.desc()).all()
-    return [
-        {
+    results = []
+
+    for u in users:
+        sessions = (
+            db.query(DBIntakeSession)
+            .filter(DBIntakeSession.user_id == u.id)
+            .order_by(DBIntakeSession.created_at.asc())
+            .all()
+        )
+        results.append({
             "user_id": u.id,
             "username": u.username,
-            "role": u.role,
-            "registered_at": u.created_at
-        }
-        for u in users
-    ]
+            "registered_at": u.created_at,
+            "total_intakes": len(sessions),
+            "records": [
+                {
+                    "session_id": s.id,
+                    "input_type": s.source_type,  # text, chat, document_scan, audio
+                    "target_language": s.target_language,
+                    "customer_raw_input": s.raw_input,  # Shows exact text typed, audio file name, or scan uploaded
+                    "chief_complaint": s.chief_complaint,
+                    "full_extracted_clinical_json": parse_extracted_data(s.extracted_data_json),
+                    "doctor_summary": s.concise_doctor_summary,
+                    "submitted_at": s.created_at
+                }
+                for s in sessions
+            ]
+        })
 
-@router.get("/users/{user_id}")
-def get_user_details(user_id: int, db: Session = Depends(get_db)):
-    """Creator view: inspects all historical files and clinical data for a user."""
+    return results
+
+@router.get("/creator/user/{user_id}")
+def get_single_user_full_data(user_id: int, db: Session = Depends(get_db)):
+    """Creator view: Fetches the complete raw inputs, scans, audio notes, 
+    and extracted clinical profiles for a single specific user ID."""
     user = db.query(DBUser).filter(DBUser.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -68,27 +101,30 @@ def get_user_details(user_id: int, db: Session = Depends(get_db)):
         .order_by(DBIntakeSession.created_at.asc())
         .all()
     )
+
     return {
         "user_id": user.id,
         "username": user.username,
         "registered_at": user.created_at,
         "total_intakes": len(sessions),
-        "intake_history": [
+        "intake_records": [
             {
                 "session_id": s.id,
-                "source_type": s.source_type,
+                "input_type": s.source_type,  # text, chat, document_scan, audio
                 "target_language": s.target_language,
+                "customer_raw_input": s.raw_input,  # Exactly what the customer sent
                 "chief_complaint": s.chief_complaint,
-                "summary": s.concise_doctor_summary,
-                "timestamp": s.created_at
+                "full_extracted_clinical_json": parse_extracted_data(s.extracted_data_json),
+                "doctor_summary": s.concise_doctor_summary,
+                "submitted_at": s.created_at
             }
             for s in sessions
         ]
     }
 
-@router.delete("/users/{user_id}")
+@router.delete("/creator/user/{user_id}")
 def delete_user(user_id: int, db: Session = Depends(get_db)):
-    """Creator action: permanently deletes a user and wipes all their session records."""
+    """Creator action: Permanently deletes a user and purges all their session records."""
     user = db.query(DBUser).filter(DBUser.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
