@@ -8,7 +8,7 @@ class DBUser(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(50), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
-    full_name = Column(String(100), nullable=False)
+    full_name = Column(String(100), default="Patient")
     role = Column(String(20), default="patient")
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -17,11 +17,10 @@ class DBIntakeSession(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, nullable=False, index=True)
-    source_type = Column(String(30))  # "chat", "description", "document_scan", "audio"
+    source_type = Column(String(30))
     target_language = Column(String(30), default="English")
     raw_input = Column(Text, nullable=False)
     chief_complaint = Column(String(255))
     extracted_data_json = Column(Text)
     concise_doctor_summary = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
-
