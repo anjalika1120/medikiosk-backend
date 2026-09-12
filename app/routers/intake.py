@@ -14,7 +14,7 @@ router = APIRouter(prefix="/api/intake", tags=["Intake & Sessions"])
 
 
 # ==========================================
-# Pydantic Schemas
+# 1. Pydantic Schemas
 # ==========================================
 
 class TextIntakeRequest(BaseModel):
@@ -25,12 +25,13 @@ class TextIntakeRequest(BaseModel):
 
 
 # ==========================================
-# Helper: Cumulative History Retrieval
+# 2. Cumulative History & Payload Builders
 # ==========================================
 
 def get_patient_history_context(db: Session, user_id: int) -> str:
     """
-    Fetches all previous intake records for the patient to maintain continuous context.
+    Fetches all historical records for the patient and aggregates past complaints,
+    allergies, medications, and physician notes into clinical context for Gemini.
     """
     prior_sessions = (
         db.query(DBIntakeSession)
@@ -40,21 +41,90 @@ def get_patient_history_context(db: Session, user_id: int) -> str:
     )
 
     if not prior_sessions:
-        return "No prior medical history available for this patient."
+        return "No prior medical history recorded for this patient."
 
     history_lines = []
     for idx, s in enumerate(prior_sessions, 1):
+        dt_str = s.created_at.isoformat() if hasattr(s.created_at, "isoformat") else str(s.created_at)
         history_lines.append(
-            f"--- Prior Record {idx} ({s.source_type} on {s.created_at}) ---\n"
+            f"--- [Session #{s.id} | Date: {dt_str} | Modality: {s.source_type}] ---\n"
             f"Chief Complaint: {s.chief_complaint}\n"
-            f"Doctor Summary: {s.concise_doctor_summary}\n"
+            f"Prior Doctor Summary: {s.concise_doctor_summary}\n"
             f"Extracted Findings: {s.extracted_data_json}"
         )
     return "\n\n".join(history_lines)
 
 
+def build_doctor_triage_payload(
+    db: Session,
+    user_id: int,
+    current_session: DBIntakeSession,
+    gemini_data: dict,
+    target_language: str
+) -> dict:
+    """
+    Assembles the unified gold-standard clinical JSON schema combining database
+    session history and Gemini clinical extractions.
+    """
+    all_sessions = (
+        db.query(DBIntakeSession)
+        .filter(DBIntakeSession.user_id == user_id)
+        .order_by(DBIntakeSession.created_at.asc())
+        .all()
+    )
+
+    timeline = [
+        {
+            "session_id": s.id,
+            "date_time": s.created_at.isoformat() if hasattr(s.created_at, "isoformat") else str(s.created_at),
+            "modality": s.source_type,
+            "key_event": s.chief_complaint
+        }
+        for s in all_sessions
+    ]
+
+    return {
+        "doctor_session_view": {
+            "current_session_id": current_session.id,
+            "user_id": user_id,
+            "total_historical_sessions": len(all_sessions),
+            "session_timeline": timeline
+        },
+        "triage_priority_alerts": gemini_data.get("triage_priority_alerts", {
+            "critical_allergies": [],
+            "red_flags": []
+        }),
+        "patient_demographics": gemini_data.get("patient_demographics", {
+            "name": None,
+            "age": None,
+            "gender": None
+        }),
+        "chief_complaints_cumulative": gemini_data.get("chief_complaints_cumulative", []),
+        "history_of_present_illness": gemini_data.get("history_of_present_illness", ""),
+        "comprehensive_medical_history": gemini_data.get("comprehensive_medical_history", {
+            "chronic_conditions": [],
+            "past_surgeries_hospitalizations": [],
+            "current_medications": [],
+            "discontinued_or_ineffective_medications": [],
+            "allergies": [],
+            "family_history": []
+        }),
+        "vitals_reported": gemini_data.get("vitals_reported", {
+            "temperature": None,
+            "blood_pressure": None,
+            "heart_rate": None,
+            "blood_sugar": None,
+            "oxygen_saturation_spo2": None
+        }),
+        "clinical_summary_for_doctor": gemini_data.get(
+            "clinical_summary_for_doctor",
+            current_session.concise_doctor_summary
+        )
+    }
+
+
 # ==========================================
-# 1. Text & Dialogue Intake Endpoint
+# 3. Text & Dialogue Intake Endpoint
 # ==========================================
 
 @router.post("/text")
@@ -69,9 +139,10 @@ async def process_text_intake(
             detail=f"User with ID {req.user_id} does not exist."
         )
 
+    # 1. Gather all prior patient history
     history_context = get_patient_history_context(db, req.user_id)
 
-    # Call Gemini clinical engine with cumulative context
+    # 2. Call Gemini clinical engine with cumulative context
     gemini_result = await process_clinical_intake(
         input_type=req.source_type,
         raw_text=req.content,
@@ -79,34 +150,37 @@ async def process_text_intake(
         target_language=req.target_language
     )
 
-    # Persist session to SQLite database
+    # 3. Determine chief complaint and summary for quick indexing
+    complaints = gemini_result.get("chief_complaints_cumulative", [])
+    primary_complaint = complaints[0].get("symptom", "Not specified") if complaints else "Not specified"
+    summary = gemini_result.get("clinical_summary_for_doctor", "")
+
+    # 4. Persist to SQLite
     new_session = DBIntakeSession(
         user_id=req.user_id,
         source_type=req.source_type,
         target_language=req.target_language,
         raw_input=req.content,
-        chief_complaint=gemini_result.get("chief_complaint", "Not specified"),
-        extracted_data_json=json.dumps(gemini_result.get("extracted_data", {})),
-        concise_doctor_summary=gemini_result.get("concise_doctor_summary", ""),
+        chief_complaint=primary_complaint,
+        extracted_data_json=json.dumps(gemini_result),
+        concise_doctor_summary=summary,
     )
     db.add(new_session)
     db.commit()
     db.refresh(new_session)
 
-    return {
-        "session_id": new_session.id,
-        "user_id": req.user_id,
-        "source_type": req.source_type,
-        "target_language": req.target_language,
-        "chief_complaint": new_session.chief_complaint,
-        "concise_doctor_summary": new_session.concise_doctor_summary,
-        "extracted_data": gemini_result.get("extracted_data", {}),
-        "created_at": new_session.created_at
-    }
+    # 5. Return the unified doctor triage JSON
+    return build_doctor_triage_payload(
+        db=db,
+        user_id=req.user_id,
+        current_session=new_session,
+        gemini_data=gemini_result,
+        target_language=req.target_language
+    )
 
 
 # ==========================================
-# 2. Document & Image (OCR) Intake Endpoint
+# 4. Document & Image (OCR) Intake Endpoint
 # ==========================================
 
 @router.post("/documents")
@@ -159,7 +233,7 @@ async def process_document_intake(
     combined_text = "\n\n".join(extracted_text_chunks)
     history_context = get_patient_history_context(db, user_id)
 
-    # Process images and parsed text with Gemini
+    # Call Gemini clinical engine with multimodal parts & cumulative context
     gemini_result = await process_clinical_intake(
         input_type="document_scan",
         raw_text=combined_text,
@@ -168,35 +242,34 @@ async def process_document_intake(
         target_language=target_language
     )
 
-    # Record session
+    complaints = gemini_result.get("chief_complaints_cumulative", [])
+    primary_complaint = complaints[0].get("symptom", "Not specified") if complaints else "Prescription / Document Intake"
+    summary = gemini_result.get("clinical_summary_for_doctor", "")
+
     new_session = DBIntakeSession(
         user_id=user_id,
         source_type="document_scan",
         target_language=target_language,
         raw_input=f"Uploaded Files: {', '.join(file_names)}\n{combined_text}".strip(),
-        chief_complaint=gemini_result.get("chief_complaint", "Not specified"),
-        extracted_data_json=json.dumps(gemini_result.get("extracted_data", {})),
-        concise_doctor_summary=gemini_result.get("concise_doctor_summary", ""),
+        chief_complaint=primary_complaint,
+        extracted_data_json=json.dumps(gemini_result),
+        concise_doctor_summary=summary,
     )
     db.add(new_session)
     db.commit()
     db.refresh(new_session)
 
-    return {
-        "session_id": new_session.id,
-        "user_id": user_id,
-        "source_type": "document_scan",
-        "target_language": target_language,
-        "processed_files": file_names,
-        "chief_complaint": new_session.chief_complaint,
-        "concise_doctor_summary": new_session.concise_doctor_summary,
-        "extracted_data": gemini_result.get("extracted_data", {}),
-        "created_at": new_session.created_at
-    }
+    return build_doctor_triage_payload(
+        db=db,
+        user_id=user_id,
+        current_session=new_session,
+        gemini_data=gemini_result,
+        target_language=target_language
+    )
 
 
 # ==========================================
-# 3. Audio Voice Intake Endpoint
+# 5. Audio Voice Intake Endpoint
 # ==========================================
 
 @router.post("/audio")
@@ -218,9 +291,9 @@ async def process_audio(
 
     mime_type = audio_file.content_type or "audio/mp3"
     if "octet-stream" in mime_type:
-        if audio_file.filename.endswith(".wav"):
+        if audio_file.filename.lower().endswith(".wav"):
             mime_type = "audio/wav"
-        elif audio_file.filename.endswith(".m4a"):
+        elif audio_file.filename.lower().endswith(".m4a"):
             mime_type = "audio/m4a"
         else:
             mime_type = "audio/mp3"
@@ -232,34 +305,34 @@ async def process_audio(
         target_language=target_language
     )
 
+    complaints = gemini_result.get("chief_complaints_cumulative", [])
+    primary_complaint = complaints[0].get("symptom", "Not specified") if complaints else "Audio Voice Intake"
+    summary = gemini_result.get("clinical_summary_for_doctor", "")
+
     new_session = DBIntakeSession(
         user_id=user_id,
         source_type="audio",
         target_language=target_language,
         raw_input=f"Audio Recording: {audio_file.filename}",
-        chief_complaint=gemini_result.get("chief_complaint", "Not specified"),
-        extracted_data_json=json.dumps(gemini_result.get("extracted_data", {})),
-        concise_doctor_summary=gemini_result.get("concise_doctor_summary", ""),
+        chief_complaint=primary_complaint,
+        extracted_data_json=json.dumps(gemini_result),
+        concise_doctor_summary=summary,
     )
     db.add(new_session)
     db.commit()
     db.refresh(new_session)
 
-    return {
-        "session_id": new_session.id,
-        "user_id": user_id,
-        "source_type": "audio",
-        "target_language": target_language,
-        "audio_file": audio_file.filename,
-        "chief_complaint": new_session.chief_complaint,
-        "concise_doctor_summary": new_session.concise_doctor_summary,
-        "extracted_data": gemini_result.get("extracted_data", {}),
-        "created_at": new_session.created_at
-    }
+    return build_doctor_triage_payload(
+        db=db,
+        user_id=user_id,
+        current_session=new_session,
+        gemini_data=gemini_result,
+        target_language=target_language
+    )
 
 
 # ==========================================
-# 4. Standard Patient Session History
+# 6. Patient Chronological History Endpoint
 # ==========================================
 
 @router.get("/sessions/{user_id}")
@@ -278,16 +351,24 @@ def get_user_sessions(user_id: int, db: Session = Depends(get_db)):
         .all()
     )
 
-    return [
-        {
+    results = []
+    for s in sessions:
+        parsed_data = {}
+        if s.extracted_data_json:
+            try:
+                parsed_data = json.loads(s.extracted_data_json)
+            except Exception:
+                parsed_data = {}
+
+        results.append({
             "session_id": s.id,
             "source_type": s.source_type,
             "target_language": s.target_language,
             "chief_complaint": s.chief_complaint,
             "concise_doctor_summary": s.concise_doctor_summary,
-            "extracted_data": json.loads(s.extracted_data_json) if s.extracted_data_json else {},
+            "extracted_clinical_record": parsed_data,
             "created_at": s.created_at
-        }
-        for s in sessions
-    ]
-                
+        })
+
+    return results
+                        
