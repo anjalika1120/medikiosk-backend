@@ -1,19 +1,47 @@
-import json
 import os
+import json
+import logging
+from typing import List, Optional, Dict, Any
 from google import genai
 from google.genai import types
 
-# Setup client (with your key fallback)
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+logger = logging.getLogger(__name__)
+
+# -------------------------------------------------------------
+# 1. API Keys Pool (Reads all 3 keys)
+# -------------------------------------------------------------
+RAW_KEYS = [
+    os.getenv("GEMINI_API_KEY"),
+    os.getenv("GEMINI_API_KEY_2") or os.getenv("GEMINI_BACKUP_KEY_1"),
+    os.getenv("GEMINI_API_KEY_3") or os.getenv("GEMINI_BACKUP_KEY_2"),
+]
+API_KEYS = [k.strip() for k in RAW_KEYS if k and k.strip()]
+
+# -------------------------------------------------------------
+# 2. Model Hierarchy (Tier 1: 3.6 -> Tier 2: 2.5 -> Tier 3: 1.5)
+# -------------------------------------------------------------
+FALLBACK_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-2.5-flash",
+    "gemini-1.5-flash"
+]
 
 CLINICAL_SYSTEM_INSTRUCTION = """
-You are an expert clinical medical intelligence engine for hospital intake.
-Your task is to analyze new patient inputs (text, doctor-patient dialogues, scanned documents/prescriptions, or audio transcriptions) alongside ALL PRIOR HISTORICAL SESSIONS for this patient.
+You are an expert clinical medical intake intelligence engine.
+Your task is to analyze patient intake data (descriptions, doctor-patient dialogues, scanned documents/prescriptions, or audio recordings) alongside ALL PRIOR HISTORICAL SESSIONS for this patient.
 
 CRITICAL INSTRUCTIONS:
-1. CUMULATIVE SYNTHESIS: You must preserve all historical facts (allergies, prior complaints, past medications, vitals) across sessions. If an allergy or condition was mentioned in an earlier session, carry it forward into the active list.
-2. SUMMARY COMPLETENESS: The `clinical_summary_for_doctor` MUST be concise (2-3 sentences) but MUST explicitly mention both prior session findings and the current session updates.
-3. OUTPUT FORMAT: You MUST return ONLY valid JSON adhering strictly to this schema:
+1. CUMULATIVE MEDICAL MEMORY:
+   - Carry forward all past allergies, chronic conditions, and ongoing medications from the prior history.
+   - If a patient reported an allergy in an earlier session, it MUST still appear under triage_priority_alerts.critical_allergies.
+   - Contrast new symptoms with prior symptoms to reflect progression (resolved vs newly developed).
+
+2. DOCTOR SUMMARY:
+   - Write a 2-3 sentence clinical summary for the attending doctor.
+   - The summary MUST explicitly synthesize prior session records with current session updates.
+
+3. SCHEMA COMPLIANCE:
+   - Output ONLY valid JSON adhering strictly to this structure:
 
 {
   "triage_priority_alerts": {
@@ -28,7 +56,7 @@ CRITICAL INSTRUCTIONS:
   },
   "patient_demographics": {
     "name": "string or null",
-    "age": "integer, string, or null",
+    "age": "integer or null",
     "gender": "string or null"
   },
   "chief_complaints_cumulative": [
@@ -78,27 +106,72 @@ CRITICAL INSTRUCTIONS:
 }
 """
 
+
+async def execute_gemini_with_failover(contents: list) -> dict:
+    """
+    Cycles across all 3 API keys and model tiers (3.6 -> 2.5 -> 1.5)
+    to handle rate limits or regional quota caps.
+    """
+    if not API_KEYS:
+        raise ValueError("No Gemini API keys found. Please set GEMINI_API_KEY.")
+
+    last_error = None
+
+    # Outer loop: Try models from highest capability down to 1.5
+    for model_name in FALLBACK_MODELS:
+        # Inner loop: Try each API key for the current model
+        for key_idx, key in enumerate(API_KEYS, start=1):
+            try:
+                client = genai.Client(api_key=key)
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=CLINICAL_SYSTEM_INSTRUCTION,
+                        response_mime_type="application/json",
+                        temperature=0.1
+                    )
+                )
+
+                raw_text = response.text.strip()
+                # Clean any stray markdown formatting if present
+                if raw_text.startswith("```"):
+                    raw_text = raw_text.split("\n", 1)[-1].rsplit("\n", 1)[0].strip()
+
+                return json.loads(raw_text)
+
+            except Exception as e:
+                logger.warning(
+                    f"Failover trigger: Model '{model_name}' with API Key #{key_idx} failed: {e}"
+                )
+                last_error = e
+                continue
+
+    raise RuntimeError(
+        f"All 3 API keys and all model tiers (3.6, 2.5, 1.5) failed. Last error: {last_error}"
+    )
+
+
 async def process_clinical_intake(
     input_type: str,
     raw_text: str = "",
-    image_parts: list = None,
+    image_parts: Optional[List[Dict[str, Any]]] = None,
     history_context: str = "",
     target_language: str = "English"
 ) -> dict:
     contents = []
-    
+
     prompt = f"""
 TARGET LANGUAGE FOR OUTPUT: {target_language}
 
-HISTORICAL INTAKE CONTEXT:
+HISTORICAL INTAKE CONTEXT (Previous visits/sessions):
 {history_context}
 
-CURRENT SESSION INPUT ({input_type}):
+CURRENT SESSION INTAKE ({input_type}):
 {raw_text}
 """
     contents.append(prompt)
 
-    # Attach images if uploaded
     if image_parts:
         for img in image_parts:
             contents.append(
@@ -108,19 +181,29 @@ CURRENT SESSION INPUT ({input_type}):
                 )
             )
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=CLINICAL_SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            temperature=0.1
-        )
-    )
+    return await execute_gemini_with_failover(contents)
 
-    try:
-        return json.loads(response.text)
-    except Exception:
-        # Fallback if raw markdown wrapped
-        cleaned = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(cleaned)
+
+async def process_audio_intake(
+    audio_bytes: bytes,
+    mime_type: str = "audio/mp3",
+    history_context: str = "",
+    target_language: str = "English"
+) -> dict:
+    prompt = f"""
+TARGET LANGUAGE FOR OUTPUT: {target_language}
+
+HISTORICAL INTAKE CONTEXT (Previous visits/sessions):
+{history_context}
+
+Please transcribe this spoken patient audio, synthesize it with their prior medical history, and extract the clinical triage JSON according to the system instructions.
+"""
+    contents = [
+        prompt,
+        types.Part.from_bytes(
+            data=audio_bytes,
+            mime_type=mime_type
+        )
+    ]
+
+    return await execute_gemini_with_failover(contents)
