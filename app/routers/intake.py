@@ -1,57 +1,116 @@
-import io
 import json
-from typing import List
-from fastapi import APIRouter, HTTPException, Depends, UploadFile, File, Form
+import io
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, status, Form, UploadFile, File
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from pypdf import PdfReader
-from google.genai import types
 
 from app.database import get_db
 from app.models import DBUser, DBIntakeSession
-from app.schemas import TextIntakeRequest
-from app.gemini_service import compile_patient_history, generate_robust
+from app.gemini_service import process_clinical_intake, process_audio_intake
 
-router = APIRouter(prefix="/api", tags=["Intake & Sessions"])
+router = APIRouter(prefix="/api/intake", tags=["Intake & Sessions"])
 
-@router.post("/intake/text")
-def process_text_intake(req: TextIntakeRequest, db: Session = Depends(get_db)):
-    user = db.query(DBUser).filter(DBUser.id == req.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User ID not found")
 
-    prior_history = compile_patient_history(user.id, db)
-    prompt = (
-        f"PATIENT PRIOR HISTORY:\n{prior_history}\n\n"
-        f"NEW INCOMING ENTRY ({req.source_type.upper()}):\n{req.content}\n\n"
-        f"Integrate this input with past records and output in target language: {req.target_language}."
+# ==========================================
+# Pydantic Schemas
+# ==========================================
+
+class TextIntakeRequest(BaseModel):
+    user_id: int
+    source_type: str = "description"  # "description" or "chat"
+    content: str
+    target_language: str = "English"
+
+
+# ==========================================
+# Helper: Cumulative History Retrieval
+# ==========================================
+
+def get_patient_history_context(db: Session, user_id: int) -> str:
+    """
+    Fetches all previous intake records for the patient to maintain continuous context.
+    """
+    prior_sessions = (
+        db.query(DBIntakeSession)
+        .filter(DBIntakeSession.user_id == user_id)
+        .order_by(DBIntakeSession.created_at.asc())
+        .all()
     )
 
-    response = generate_robust(prompt, target_language=req.target_language)
-    data = json.loads(response.text)
+    if not prior_sessions:
+        return "No prior medical history available for this patient."
 
-    session_entry = DBIntakeSession(
-        user_id=user.id,
+    history_lines = []
+    for idx, s in enumerate(prior_sessions, 1):
+        history_lines.append(
+            f"--- Prior Record {idx} ({s.source_type} on {s.created_at}) ---\n"
+            f"Chief Complaint: {s.chief_complaint}\n"
+            f"Doctor Summary: {s.concise_doctor_summary}\n"
+            f"Extracted Findings: {s.extracted_data_json}"
+        )
+    return "\n\n".join(history_lines)
+
+
+# ==========================================
+# 1. Text & Dialogue Intake Endpoint
+# ==========================================
+
+@router.post("/text")
+async def process_text_intake(
+    req: TextIntakeRequest,
+    db: Session = Depends(get_db)
+):
+    user = db.query(DBUser).filter(DBUser.id == req.user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User with ID {req.user_id} does not exist."
+        )
+
+    history_context = get_patient_history_context(db, req.user_id)
+
+    # Call Gemini clinical engine with cumulative context
+    gemini_result = await process_clinical_intake(
+        input_type=req.source_type,
+        raw_text=req.content,
+        history_context=history_context,
+        target_language=req.target_language
+    )
+
+    # Persist session to SQLite database
+    new_session = DBIntakeSession(
+        user_id=req.user_id,
         source_type=req.source_type,
         target_language=req.target_language,
         raw_input=req.content,
-        chief_complaint=data.get("main_concern", "Text Intake"),
-        extracted_data_json=response.text,
-        concise_doctor_summary=data.get("concise_doctor_summary", "")
+        chief_complaint=gemini_result.get("chief_complaint", "Not specified"),
+        extracted_data_json=json.dumps(gemini_result.get("extracted_data", {})),
+        concise_doctor_summary=gemini_result.get("concise_doctor_summary", ""),
     )
-    db.add(session_entry)
+    db.add(new_session)
     db.commit()
-    db.refresh(session_entry)
+    db.refresh(new_session)
 
     return {
-        "session_id": session_entry.id,
-        "patient": user.full_name,
+        "session_id": new_session.id,
+        "user_id": req.user_id,
+        "source_type": req.source_type,
         "target_language": req.target_language,
-        "cumulative_structured_data": data,
-        "concise_doctor_summary": session_entry.concise_doctor_summary
+        "chief_complaint": new_session.chief_complaint,
+        "concise_doctor_summary": new_session.concise_doctor_summary,
+        "extracted_data": gemini_result.get("extracted_data", {}),
+        "created_at": new_session.created_at
     }
 
-@router.post("/intake/documents")
-async def process_document_scans(
+
+# ==========================================
+# 2. Document & Image (OCR) Intake Endpoint
+# ==========================================
+
+@router.post("/documents")
+async def process_document_intake(
     user_id: int = Form(...),
     target_language: str = Form("English"),
     files: List[UploadFile] = File(...),
@@ -59,124 +118,176 @@ async def process_document_scans(
 ):
     user = db.query(DBUser).filter(DBUser.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User ID not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User with ID {user_id} does not exist."
+        )
 
-    prior_history = compile_patient_history(user.id, db)
-    multimodal_parts = []
+    if not files:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No files were uploaded."
+        )
+
+    extracted_text_chunks = []
+    image_parts = []
     file_names = []
 
-    for f in files:
-        file_names.append(f.filename)
-        file_bytes = await f.read()
-        mime = f.content_type or "image/png"
+    for file in files:
+        file_names.append(file.filename)
+        content_type = file.content_type or ""
+        file_bytes = await file.read()
 
-        if "pdf" in mime or f.filename.endswith(".pdf"):
+        # Handle PDF documents
+        if content_type == "application/pdf" or file.filename.lower().endswith(".pdf"):
             try:
-                pdf_reader = PdfReader(io.BytesIO(file_bytes))
-                extracted_pdf_text = "\n".join([page.extract_text() or "" for page in pdf_reader.pages])
-                multimodal_parts.append(f"\n[Uploaded PDF: {f.filename}]\n{extracted_pdf_text}")
-            except Exception:
-                multimodal_parts.append(types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"))
+                reader = PdfReader(io.BytesIO(file_bytes))
+                pdf_text = "\n".join([page.extract_text() or "" for page in reader.pages])
+                extracted_text_chunks.append(f"[Document: {file.filename}]\n{pdf_text}")
+            except Exception as e:
+                extracted_text_chunks.append(f"[Error reading PDF {file.filename}: {str(e)}]")
+
+        # Handle Image uploads (Prescriptions, Lab tests, Scans)
+        elif content_type.startswith("image/") or file.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            image_parts.append({
+                "mime_type": content_type if content_type.startswith("image/") else "image/jpeg",
+                "data": file_bytes
+            })
         else:
-            multimodal_parts.append(types.Part.from_bytes(data=file_bytes, mime_type=mime))
+            extracted_text_chunks.append(f"[Unsupported file type: {file.filename}]")
 
-    prompt = (
-        f"PATIENT PRIOR HISTORY:\n{prior_history}\n\n"
-        f"NEW INCOMING DOCUMENTS:\n"
-        f"Extract all clinical data, lab values, and prescription text from these scans/PDFs. "
-        f"Support multilingual text (including Hindi Devanagari and English). "
-        f"Synthesize with prior patient history and convert the structured output and summary into {target_language}."
+    combined_text = "\n\n".join(extracted_text_chunks)
+    history_context = get_patient_history_context(db, user_id)
+
+    # Process images and parsed text with Gemini
+    gemini_result = await process_clinical_intake(
+        input_type="document_scan",
+        raw_text=combined_text,
+        image_parts=image_parts,
+        history_context=history_context,
+        target_language=target_language
     )
-    multimodal_parts.append(prompt)
 
-    response = generate_robust(multimodal_parts, target_language=target_language)
-    data = json.loads(response.text)
-
-    session_entry = DBIntakeSession(
-        user_id=user.id,
+    # Record session
+    new_session = DBIntakeSession(
+        user_id=user_id,
         source_type="document_scan",
         target_language=target_language,
-        raw_input=f"Files uploaded: {', '.join(file_names)}",
-        chief_complaint=data.get("main_concern", "Prescription/Report OCR"),
-        extracted_data_json=response.text,
-        concise_doctor_summary=data.get("concise_doctor_summary", "")
+        raw_input=f"Uploaded Files: {', '.join(file_names)}\n{combined_text}".strip(),
+        chief_complaint=gemini_result.get("chief_complaint", "Not specified"),
+        extracted_data_json=json.dumps(gemini_result.get("extracted_data", {})),
+        concise_doctor_summary=gemini_result.get("concise_doctor_summary", ""),
     )
-    db.add(session_entry)
+    db.add(new_session)
     db.commit()
-    db.refresh(session_entry)
+    db.refresh(new_session)
 
     return {
-        "session_id": session_entry.id,
-        "patient": user.full_name,
-        "files_analyzed": file_names,
+        "session_id": new_session.id,
+        "user_id": user_id,
+        "source_type": "document_scan",
         "target_language": target_language,
-        "cumulative_structured_data": data,
-        "concise_doctor_summary": session_entry.concise_doctor_summary
+        "processed_files": file_names,
+        "chief_complaint": new_session.chief_complaint,
+        "concise_doctor_summary": new_session.concise_doctor_summary,
+        "extracted_data": gemini_result.get("extracted_data", {}),
+        "created_at": new_session.created_at
     }
 
-@router.post("/intake/audio")
-async def process_audio_intake(
+
+# ==========================================
+# 3. Audio Voice Intake Endpoint
+# ==========================================
+
+@router.post("/audio")
+async def process_audio(
     user_id: int = Form(...),
     target_language: str = Form("English"),
-    file: UploadFile = File(...),
+    audio_file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
     user = db.query(DBUser).filter(DBUser.id == user_id).first()
     if not user:
-        raise HTTPException(status_code=404, detail="User ID not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User with ID {user_id} does not exist."
+        )
 
-    audio_bytes = await file.read()
-    mime = file.content_type or "audio/mp3"
-    audio_part = types.Part.from_bytes(data=audio_bytes, mime_type=mime)
+    audio_bytes = await audio_file.read()
+    history_context = get_patient_history_context(db, user_id)
 
-    prior_history = compile_patient_history(user.id, db)
-    prompt = (
-        f"PATIENT PRIOR HISTORY:\n{prior_history}\n\n"
-        f"Transcribe this clinical audio recording (spoken in Hindi, Hinglish, English, or regional dialects). "
-        f"Extract new symptoms and clinical notes, synthesize with all previous records, "
-        f"and return the combined clinical record and doctor summary translated into {target_language}."
+    mime_type = audio_file.content_type or "audio/mp3"
+    if "octet-stream" in mime_type:
+        if audio_file.filename.endswith(".wav"):
+            mime_type = "audio/wav"
+        elif audio_file.filename.endswith(".m4a"):
+            mime_type = "audio/m4a"
+        else:
+            mime_type = "audio/mp3"
+
+    gemini_result = await process_audio_intake(
+        audio_bytes=audio_bytes,
+        mime_type=mime_type,
+        history_context=history_context,
+        target_language=target_language
     )
 
-    response = generate_robust([audio_part, prompt], target_language=target_language)
-    data = json.loads(response.text)
-
-    session_entry = DBIntakeSession(
-        user_id=user.id,
+    new_session = DBIntakeSession(
+        user_id=user_id,
         source_type="audio",
         target_language=target_language,
-        raw_input=f"Audio intake: {file.filename}",
-        chief_complaint=data.get("main_concern", "Audio Clinical Intake"),
-        extracted_data_json=response.text,
-        concise_doctor_summary=data.get("concise_doctor_summary", "")
+        raw_input=f"Audio Recording: {audio_file.filename}",
+        chief_complaint=gemini_result.get("chief_complaint", "Not specified"),
+        extracted_data_json=json.dumps(gemini_result.get("extracted_data", {})),
+        concise_doctor_summary=gemini_result.get("concise_doctor_summary", ""),
     )
-    db.add(session_entry)
+    db.add(new_session)
     db.commit()
-    db.refresh(session_entry)
+    db.refresh(new_session)
 
     return {
-        "session_id": session_entry.id,
-        "patient": user.full_name,
+        "session_id": new_session.id,
+        "user_id": user_id,
+        "source_type": "audio",
         "target_language": target_language,
-        "cumulative_structured_data": data,
-        "concise_doctor_summary": session_entry.concise_doctor_summary
+        "audio_file": audio_file.filename,
+        "chief_complaint": new_session.chief_complaint,
+        "concise_doctor_summary": new_session.concise_doctor_summary,
+        "extracted_data": gemini_result.get("extracted_data", {}),
+        "created_at": new_session.created_at
     }
+
+
+# ==========================================
+# 4. Standard Patient Session History
+# ==========================================
 
 @router.get("/sessions/{user_id}")
 def get_user_sessions(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(DBUser).filter(DBUser.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User with ID {user_id} does not exist."
+        )
+
     sessions = (
         db.query(DBIntakeSession)
         .filter(DBIntakeSession.user_id == user_id)
-        .order_by(DBIntakeSession.created_at.asc())
+        .order_by(DBIntakeSession.created_at.desc())
         .all()
     )
+
     return [
         {
             "session_id": s.id,
             "source_type": s.source_type,
             "target_language": s.target_language,
             "chief_complaint": s.chief_complaint,
-            "cumulative_summary": s.concise_doctor_summary,
-            "timestamp": s.created_at
+            "concise_doctor_summary": s.concise_doctor_summary,
+            "extracted_data": json.loads(s.extracted_data_json) if s.extracted_data_json else {},
+            "created_at": s.created_at
         }
         for s in sessions
     ]
+                
