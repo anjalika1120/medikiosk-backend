@@ -4,8 +4,6 @@ from pydantic import BaseModel, field_validator
 class RegisterRequest(BaseModel):
     username: str
     password: str
-    full_name: str
-    role: Optional[Literal["patient", "doctor", "creator"]] = "patient"
 
     @field_validator("username")
     @classmethod
@@ -30,5 +28,4 @@ class TextIntakeRequest(BaseModel):
     user_id: int
     source_type: Literal["chat", "description"]
     content: str
-    target_language: Optional[str] = "English"  # e.g., "Hindi", "English", "Spanish"
-
+    target_language: Optional[str] = "English"
