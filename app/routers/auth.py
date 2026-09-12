@@ -5,7 +5,7 @@ from app.models import DBUser, DBIntakeSession
 from app.schemas import RegisterRequest, LoginRequest
 from app.security import hash_password, verify_password
 
-router = APIRouter(prefix="/api/auth", tags=["Authentication & Creator Management"])
+router = APIRouter(prefix="/api/auth", tags=["Authentication & Creator Admin"])
 
 @router.post("/register")
 def register_user(req: RegisterRequest, db: Session = Depends(get_db)):
@@ -39,11 +39,11 @@ def login_user(req: LoginRequest, db: Session = Depends(get_db)):
         "role": user.role
     }
 
-# ==================== CREATOR ADMIN CONTROLS ====================
+# ==================== CREATOR CONTROLS ====================
 
 @router.get("/users")
 def get_all_users(db: Session = Depends(get_db)):
-    """Allows creator to view all registered users in the database."""
+    """Creator view: lists every registered user."""
     users = db.query(DBUser).order_by(DBUser.created_at.desc()).all()
     return [
         {
@@ -57,7 +57,7 @@ def get_all_users(db: Session = Depends(get_db)):
 
 @router.get("/users/{user_id}")
 def get_user_details(user_id: int, db: Session = Depends(get_db)):
-    """Allows creator to inspect a specific user and all their clinical sessions."""
+    """Creator view: inspects all historical files and clinical data for a user."""
     user = db.query(DBUser).filter(DBUser.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -68,11 +68,9 @@ def get_user_details(user_id: int, db: Session = Depends(get_db)):
         .order_by(DBIntakeSession.created_at.asc())
         .all()
     )
-    
     return {
         "user_id": user.id,
         "username": user.username,
-        "role": user.role,
         "registered_at": user.created_at,
         "total_intakes": len(sessions),
         "intake_history": [
@@ -90,16 +88,12 @@ def get_user_details(user_id: int, db: Session = Depends(get_db)):
 
 @router.delete("/users/{user_id}")
 def delete_user(user_id: int, db: Session = Depends(get_db)):
-    """Allows creator to permanently delete a user and all their associated sessions."""
+    """Creator action: permanently deletes a user and wipes all their session records."""
     user = db.query(DBUser).filter(DBUser.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # Delete all associated intake sessions
     db.query(DBIntakeSession).filter(DBIntakeSession.user_id == user_id).delete()
-    
-    # Delete user profile
     db.delete(user)
     db.commit()
-    
-    return {"message": f"User {user.username} (ID: {user_id}) and all clinical sessions permanently deleted."}
+    return {"message": f"User {user.username} (ID: {user_id}) and all intake records permanently deleted."}
