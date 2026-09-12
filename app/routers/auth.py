@@ -1,4 +1,4 @@
-    import json
+import json
 from typing import List, Optional
 import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, status
