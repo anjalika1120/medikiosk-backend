@@ -1,105 +1,126 @@
+import json
 import os
-import time
-from sqlalchemy.orm import Session
 from google import genai
 from google.genai import types
-from app.models import DBIntakeSession
 
-# Load primary and secondary API keys from environment
-GEMINI_API_KEYS = [
-    os.getenv("GEMINI_API_KEY", ""),
-    os.getenv("GEMINI_BACKUP_KEY_1", ""),
-    os.getenv("GEMINI_BACKUP_KEY_2", "")
-]
-valid_keys = [k for k in GEMINI_API_KEYS if k.strip()]
+# Setup client (with your key fallback)
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Model cascade hierarchy (tries latest first, then falls back)
-CANDIDATE_MODELS = [
-    "gemini-3.6-flash",
-    "gemini-2.5-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-pro",
-]
+CLINICAL_SYSTEM_INSTRUCTION = """
+You are an expert clinical medical intelligence engine for hospital intake.
+Your task is to analyze new patient inputs (text, doctor-patient dialogues, scanned documents/prescriptions, or audio transcriptions) alongside ALL PRIOR HISTORICAL SESSIONS for this patient.
 
-def get_gemini_client(key_index: int = 0) -> genai.Client:
-    """Returns a Gemini Client using key rotation across available tokens."""
-    if not valid_keys:
-        # Defaults to default environment resolution if no explicit array keys
-        return genai.Client()
-    selected_key = valid_keys[key_index % len(valid_keys)]
-    return genai.Client(api_key=selected_key)
+CRITICAL INSTRUCTIONS:
+1. CUMULATIVE SYNTHESIS: You must preserve all historical facts (allergies, prior complaints, past medications, vitals) across sessions. If an allergy or condition was mentioned in an earlier session, carry it forward into the active list.
+2. SUMMARY COMPLETENESS: The `clinical_summary_for_doctor` MUST be concise (2-3 sentences) but MUST explicitly mention both prior session findings and the current session updates.
+3. OUTPUT FORMAT: You MUST return ONLY valid JSON adhering strictly to this schema:
 
-def build_system_instruction(target_language: str = "English") -> str:
-    """Constructs dynamic clinical synthesis instructions enforcing the target language."""
-    return f"""
-You are an expert multilingual clinical intake AI synthesizer.
-Inputs may come in English, Hindi, Hinglish, regional scripts, scanned handwritten prescriptions, PDFs, or audio recordings.
-
-Tasks:
-1. Combine all historical patient records with incoming data into a single coherent file.
-2. Deduplicate and merge all medications, dosages, and allergies across previous and current records.
-3. Consolidate the symptom timeline continuously.
-4. Translate and present the extracted clinical values and doctor summary into the patient's chosen TARGET LANGUAGE: {target_language}.
-5. The 'concise_doctor_summary' must capture the complete visit history to date in EXACTLY TWO SENTENCES written in {target_language}.
-
-Return STRICT JSON matching this schema:
-{{
-  "main_concern": "Primary medical issue in {target_language}",
-  "symptom_timeline": "Consolidated chronological timeline in {target_language}",
-  "allergies": ["list", "of", "allergies", "in {target_language}"],
-  "medications_supplements": ["list", "of", "medications", "with", "dosages", "in {target_language}"],
-  "vital_signs_mentioned": ["list", "of", "vital", "signs"],
-  "concise_doctor_summary": "Exactly two sentences summarizing the overall clinical status for the physician in {target_language}."
-}}
-Do not wrap output in markdown fences (no ```json). Output raw JSON only.
+{
+  "triage_priority_alerts": {
+    "critical_allergies": [
+      {
+        "substance": "string",
+        "severity": "string",
+        "status": "string"
+      }
+    ],
+    "red_flags": ["string"]
+  },
+  "patient_demographics": {
+    "name": "string or null",
+    "age": "integer, string, or null",
+    "gender": "string or null"
+  },
+  "chief_complaints_cumulative": [
+    {
+      "symptom": "string",
+      "duration": "string",
+      "severity": "string",
+      "aggravating_factors": "string or null"
+    }
+  ],
+  "history_of_present_illness": "string",
+  "comprehensive_medical_history": {
+    "chronic_conditions": ["string"],
+    "past_surgeries_hospitalizations": ["string"],
+    "current_medications": [
+      {
+        "medication": "string",
+        "dosage": "string",
+        "frequency": "string",
+        "source": "string",
+        "status": "string"
+      }
+    ],
+    "discontinued_or_ineffective_medications": [
+      {
+        "medication": "string",
+        "reason": "string"
+      }
+    ],
+    "allergies": [
+      {
+        "allergen": "string",
+        "reaction": "string",
+        "contraindicated_classes": ["string"]
+      }
+    ],
+    "family_history": ["string"]
+  },
+  "vitals_reported": {
+    "temperature": "string or null",
+    "blood_pressure": "string or null",
+    "heart_rate": "string or null",
+    "blood_sugar": "string or null",
+    "oxygen_saturation_spo2": "string or null"
+  },
+  "clinical_summary_for_doctor": "string"
+}
 """
 
-def generate_robust(contents, target_language: str = "English", max_attempts: int = 3):
-    """
-    Executes content generation by rotating through both API keys and candidate models
-    to prevent quota bottlenecks, model deprecation issues, or transient downtime.
-    """
-    last_error = None
-    system_prompt = build_system_instruction(target_language)
+async def process_clinical_intake(
+    input_type: str,
+    raw_text: str = "",
+    image_parts: list = None,
+    history_context: str = "",
+    target_language: str = "English"
+) -> dict:
+    contents = []
+    
+    prompt = f"""
+TARGET LANGUAGE FOR OUTPUT: {target_language}
 
-    for model_name in CANDIDATE_MODELS:
-        for attempt in range(max_attempts):
-            try:
-                client = get_gemini_client(attempt)
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        response_mime_type="application/json"
-                    )
+HISTORICAL INTAKE CONTEXT:
+{history_context}
+
+CURRENT SESSION INPUT ({input_type}):
+{raw_text}
+"""
+    contents.append(prompt)
+
+    # Attach images if uploaded
+    if image_parts:
+        for img in image_parts:
+            contents.append(
+                types.Part.from_bytes(
+                    data=img["data"],
+                    mime_type=img["mime_type"]
                 )
-                if response and response.text:
-                    return response
-            except Exception as e:
-                last_error = e
-                time.sleep(0.5)
-                continue  # Try next key / attempt
+            )
 
-    raise RuntimeError(f"All model endpoints and keys failed. Last error: {last_error}")
-
-def compile_patient_history(user_id: int, db: Session) -> str:
-    """Fetches and aggregates all prior intake records for a cumulative clinical prompt."""
-    past_sessions = (
-        db.query(DBIntakeSession)
-        .filter(DBIntakeSession.user_id == user_id)
-        .order_by(DBIntakeSession.created_at.asc())
-        .all()
-    )
-    if not past_sessions:
-        return "No prior records. This is the patient's first intake."
-
-    history_blocks = []
-    for idx, s in enumerate(past_sessions, 1):
-        history_blocks.append(
-            f"Record #{idx} [{s.source_type.upper()}] logged on {s.created_at.strftime('%Y-%m-%d %H:%M')}:\n"
-            f"- Prior Chief Complaint: {s.chief_complaint}\n"
-            f"- Extracted Clinical JSON: {s.extracted_data_json}\n"
-            f"- Doctor Summary at that point: {s.concise_doctor_summary}\n"
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=CLINICAL_SYSTEM_INSTRUCTION,
+            response_mime_type="application/json",
+            temperature=0.1
         )
-    return "\n---\n".join(history_blocks)
+    )
+
+    try:
+        return json.loads(response.text)
+    except Exception:
+        # Fallback if raw markdown wrapped
+        cleaned = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(cleaned)
