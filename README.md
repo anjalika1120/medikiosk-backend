@@ -97,13 +97,18 @@ An intelligent, multi-language clinical intake and triage backend engine built f
 
 ```text
 ├── app/
-│   ├── database.py         # SQLAlchemy engine, session maker & Base model
-│   ├── models.py           # DBUser, DBHealthCase, DBIntakeSession schemas
-│   ├── gemini_service.py   # 3-key pool & 3-model failover logic, clinical prompts
-│   ├── main.py             # FastAPI app initialization & CORS middleware
-│   └── routers/
-│       ├── auth.py         # User registration (demographics) & login
-│       ├── intake.py       # Multimodal intake (text, multi-file docs, audio) & cases
-│       └── creator.py      # Doctor 1-min summary view & database controls
-├── requirements.txt
+│   ├── routers/
+│   │   ├── __init__.py
+│   │   ├── auth.py              # User registration (demographics) & authentication
+│   │   ├── creator.py           # Doctor 1-min quick summary & database admin
+│   │   └── intake.py            # Multimodal intake (text, up to 5 docs, audio) & cases
+│   ├── __init__.py
+│   ├── database.py              # SQLAlchemy engine, session maker & Base declarative
+│   ├── gemini_service.py        # 3-key pool & 3-model failover logic, clinical prompts
+│   ├── models.py                # DBUser, DBHealthCase, DBIntakeSession ORM tables
+│   ├── schemas.py               # Pydantic request & response payload schemas
+│   └── security.py              # Password hashing & verification utilities
+├── main.py                      # FastAPI app entrypoint, CORS & router registration
+├── requirements.txt             # Production dependency specifications
 └── README.md
+```
