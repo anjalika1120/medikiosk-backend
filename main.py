@@ -10,6 +10,10 @@ app = FastAPI(
     version="3.0.0"
 )
 
+@app.get("/health")
+def health_check():
+    return {"status": "alive"}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
