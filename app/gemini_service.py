@@ -7,9 +7,7 @@ from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------------
-# 1. API Keys Pool (Reads all 3 keys)
-# -------------------------------------------------------------
+# 3-key pool fallback
 RAW_KEYS = [
     os.getenv("GEMINI_API_KEY"),
     os.getenv("GEMINI_API_KEY_2") or os.getenv("GEMINI_BACKUP_KEY_1"),
@@ -17,9 +15,7 @@ RAW_KEYS = [
 ]
 API_KEYS = [k.strip() for k in RAW_KEYS if k and k.strip()]
 
-# -------------------------------------------------------------
-# 2. Model Hierarchy (Tier 1: 3.6 -> Tier 2: 2.5 -> Tier 3: 1.5)
-# -------------------------------------------------------------
+# 3-model cascade fallback
 FALLBACK_MODELS = [
     "gemini-3.6-flash",
     "gemini-2.5-flash",
@@ -108,18 +104,12 @@ CRITICAL INSTRUCTIONS:
 
 
 async def execute_gemini_with_failover(contents: list) -> dict:
-    """
-    Cycles across all 3 API keys and model tiers (3.6 -> 2.5 -> 1.5)
-    to handle rate limits or regional quota caps.
-    """
     if not API_KEYS:
         raise ValueError("No Gemini API keys found. Please set GEMINI_API_KEY.")
 
     last_error = None
 
-    # Outer loop: Try models from highest capability down to 1.5
     for model_name in FALLBACK_MODELS:
-        # Inner loop: Try each API key for the current model
         for key_idx, key in enumerate(API_KEYS, start=1):
             try:
                 client = genai.Client(api_key=key)
@@ -134,22 +124,16 @@ async def execute_gemini_with_failover(contents: list) -> dict:
                 )
 
                 raw_text = response.text.strip()
-                # Clean any stray markdown formatting if present
                 if raw_text.startswith("```"):
                     raw_text = raw_text.split("\n", 1)[-1].rsplit("\n", 1)[0].strip()
 
                 return json.loads(raw_text)
-
             except Exception as e:
-                logger.warning(
-                    f"Failover trigger: Model '{model_name}' with API Key #{key_idx} failed: {e}"
-                )
+                logger.warning(f"Failover: Model '{model_name}' with key #{key_idx} failed: {e}")
                 last_error = e
                 continue
 
-    raise RuntimeError(
-        f"All 3 API keys and all model tiers (3.6, 2.5, 1.5) failed. Last error: {last_error}"
-    )
+    raise RuntimeError(f"All API keys and fallback models failed. Last error: {last_error}")
 
 
 async def process_clinical_intake(
