@@ -1,15 +1,10 @@
-import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.database import Base, engine
 from app.routers import auth, intake, creator
-
-# Initialize database tables
-Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="MediKiosk Universal Multilingual AI Backend",
-    description="Multimodal clinical intake accepting Text, Audio, Scans (OCR), and PDFs with historical aggregation and language translation.",
+    description="Multimodal clinical intake accepting Text, Audio, and up to 5 Documents/Scans with cumulative memory and doctor summary.",
     version="3.0.0"
 )
 
@@ -25,11 +20,7 @@ app.include_router(auth.router)
 app.include_router(intake.router)
 app.include_router(creator.router)
 
+
 @app.get("/")
 def health_check():
-    return {"status": "active", "service": "MediKiosk Multilingual AI API v3.0"}
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True) 
+    return {"status": "online", "system": "MediKiosk Multilingual AI Backend"}
